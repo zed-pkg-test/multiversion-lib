@@ -1,0 +1,15 @@
+[project]
+name = "zedtest-multiversion-lib-py3"
+version = "0.1.0"
+description = "Python 3 line of multiversion-lib"
+license = { text = "MIT" }
+# The constraint that actually matters lives in the NATIVE manifest, because
+# zed's manifest has no field for it.
+requires-python = ">=3.9"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mvlib*"]

@@ -1,0 +1,11 @@
+{
+  "name": "@zedtest/multiversion-lib-node22",
+  "version": "0.1.0",
+  "description": "Node >=22 line of multiversion-lib (ESM)",
+  "license": "MIT",
+  "type": "module",
+  "exports": "./index.js",
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,42 @@
+[package]
+org = "zedtest"
+name = "multiversion-lib"
+version = "0.1.0"
+description = "One repo publishing two incompatible runtime lines per language."
+license = "MIT"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/zed-pkg-test/multiversion-lib"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+
+# The real-world case the tidy per-language model does not express: a library
+# that must ship SEPARATE artifacts for two incompatible runtime lines of the
+# SAME language. Python 2 vs 3 and Node <22 vs >=22 are the canonical examples
+# (`node:`-prefixed builtins and require(esm) are >=22-only).
+#
+# zed has no engine/version-constraint field -- verified against the CLI source:
+# there is no `engines`, `requires_python`, or `min_version` anywhere in the
+# manifest schema. So the only way to express this today is one target per
+# runtime line, which is exactly what this fixture pins down. Each target
+# becomes its own independently installable package, and the *native* manifest
+# inside each subtree carries the real version constraint.
+
+[targets.python2]
+dir = "py2"
+adapter = "python"
+
+[targets.python3]
+dir = "py3"
+adapter = "python"
+
+[targets.node18]
+dir = "node18"
+adapter = "node"
+
+[targets.node22]
+dir = "node22"
+adapter = "node"

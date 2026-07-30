@@ -1,0 +1,10 @@
+{
+  "name": "@zedtest/multiversion-lib-node18",
+  "version": "0.1.0",
+  "description": "Node <22 line of multiversion-lib (CommonJS)",
+  "license": "MIT",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18 <22"
+  }
+}

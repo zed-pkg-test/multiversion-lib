@@ -1,0 +1,228 @@
+name: package CI
+
+# Two things to prove: the four runtime lines really are mutually incompatible
+# (otherwise this repo should be one package, not four), and the language-tag
+# behaviour documented in the README still holds.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: multiversion-lib
+          persist-credentials: false
+
+      # zed-cli path-depends on ../zed-interfaces, so they must be siblings.
+      - name: Check out zed-cli
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: zed-pkg/zed-cli
+          path: zed-cli
+          persist-credentials: false
+      - name: Check out zed-interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: zed-pkg/zed-interfaces
+          path: zed-interfaces
+          persist-credentials: false
+
+      - name: Validate workflow
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: multiversion-lib/.github/workflows/ci.yml
+
+      - name: Native manifests carry the version constraints zed cannot express
+        working-directory: multiversion-lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          import tomllib
+          from pathlib import Path
+
+          with Path(".zpkg.toml").open("rb") as handle:
+              manifest = tomllib.load(handle)
+          targets = manifest["targets"]
+          assert set(targets) == {"python2", "python3", "node18", "node22"}, sorted(targets)
+
+          # zed has no version-constraint field, so each subtree's own manifest
+          # must carry one. A target without it would publish an artifact that
+          # claims to serve a runtime line it cannot actually run on.
+          setup_py = Path(targets["python2"]["dir"], "setup.py").read_text()
+          assert 'python_requires=">=2.7, <3"' in setup_py, setup_py
+
+          with Path(targets["python3"]["dir"], "pyproject.toml").open("rb") as handle:
+              assert tomllib.load(handle)["project"]["requires-python"] == ">=3.9"
+
+          import json
+          for target, expected in (("node18", ">=18 <22"), ("node22", ">=22")):
+              pkg = json.loads(Path(targets[target]["dir"], "package.json").read_text())
+              assert pkg["engines"]["node"] == expected, pkg["engines"]
+          PY
+
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+        with:
+          python-version: "3.12"
+
+      - name: The two Python lines are genuinely incompatible
+        working-directory: multiversion-lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          # py3 imports cleanly...
+          PYTHONPATH=py3 python -c '
+          import mvlib
+          assert mvlib.RUNTIME_LINE == "python3", mvlib.RUNTIME_LINE
+          assert mvlib.greet("ci") == "hello ci from multiversion-lib/python3"
+          '
+          # ...and py3 syntax is what makes a shared artifact impossible: the 2.7
+          # line must not be parseable as 3.x-idiomatic code and vice versa.
+          # `from __future__ import unicode_literals` still parses on 3.x, so the
+          # decisive check is the reverse direction: 3.x f-strings/annotations.
+          if python2 --version >/dev/null 2>&1; then
+            if python2 -c 'import sys; sys.path.insert(0, "py3"); import mvlib'; then
+              echo "::error::the python3 line imported under python2"
+              exit 1
+            fi
+          else
+            # No 2.7 on modern runners; assert on the syntax itself instead.
+            python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source = Path("py3/mvlib/__init__.py").read_text()
+          tree = ast.parse(source)
+          has_fstring = any(isinstance(n, ast.JoinedStr) for n in ast.walk(tree))
+          has_annotation = any(
+              isinstance(n, ast.FunctionDef) and (n.returns or any(a.annotation for a in n.args.args))
+              for n in ast.walk(tree)
+          )
+          assert has_fstring, "py3 line has no 3.x-only f-string"
+          assert has_annotation, "py3 line has no 3.x-only annotation"
+          PY
+          fi
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6
+        with:
+          node-version: 22
+
+      - name: The two Node lines are genuinely incompatible
+        working-directory: multiversion-lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The >=22 line is ESM with node:-prefixed builtins.
+          node --input-type=module -e '
+            const m = await import("./node22/index.js");
+            if (m.RUNTIME_LINE !== "node22") throw new Error(m.RUNTIME_LINE);
+            if (m.greet("ci") !== "hello ci from multiversion-lib/node22") throw new Error(m.greet("ci"));
+          '
+          # The <22 line is CommonJS and must stay require()-able.
+          node -e '
+            const m = require("./node18/index.js");
+            if (m.RUNTIME_LINE !== "node18") throw new Error(m.RUNTIME_LINE);
+          '
+          # Loading the ESM line with require() is the incompatibility, and it is
+          # only *sometimes* an error (require(esm) landed in 22), so assert on
+          # the module system rather than on a runtime failure.
+          node -e '
+            const fs = require("node:fs");
+            const pkg18 = JSON.parse(fs.readFileSync("node18/package.json", "utf8"));
+            const pkg22 = JSON.parse(fs.readFileSync("node22/package.json", "utf8"));
+            if (pkg18.type === "module") throw new Error("node18 line must be CommonJS");
+            if (pkg22.type !== "module") throw new Error("node22 line must be ESM");
+            const src18 = fs.readFileSync("node18/index.js", "utf8");
+            if (/require\("node:/.test(src18)) {
+              throw new Error("node18 line uses node:-prefixed builtins");
+            }
+          '
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Four runtime lines publish as four packages
+        working-directory: multiversion-lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --bin zed --manifest-path ../zed-cli/Cargo.toml
+          ZED="$GITHUB_WORKSPACE/zed-cli/target/release/zed"
+          mkdir -p "$RUNNER_TEMP/reg"
+          "$ZED" publish --registry "file://$RUNNER_TEMP/reg" --skip-vcs-checks
+          test "$(find "$RUNNER_TEMP/reg" -name '*.tar.gz' | wc -l)" -eq 4
+          for line in python2 python3 node18 node22; do
+            test -d "$RUNNER_TEMP/reg/packages/zedtest/multiversion-lib-$line"
+          done
+
+      - name: KNOWN GAP - a versioned target loses its language tag
+        working-directory: multiversion-lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Characterization, not endorsement. zed derives language/ecosystem by
+          # matching the TARGET NAME against a known language-token table, so
+          # `node22` and `python2` fall through to "universal" -- and the
+          # wrong-ecosystem refusal that protects polyglot-lib cannot fire.
+          #
+          # When that is fixed, THIS STEP SHOULD FAIL. Update the fixture then;
+          # do not delete the check.
+          ZED="$GITHUB_WORKSPACE/zed-cli/target/release/zed"
+          scratch="$RUNNER_TEMP/node-consumer"
+          mkdir -p "$scratch"
+          cd "$scratch"
+          printf '{\n  "name": "c",\n  "version": "0.1.0",\n  "private": true\n}\n' > package.json
+          cat > .zpkg.toml <<'TOML'
+          [package]
+          org = "zedtest"
+          name = "consumer"
+          version = "0.1.0"
+          license = "MIT"
+
+          [package.repository]
+          vcs = "git"
+          url = "https://github.com/zed-pkg-test/multiversion-lib"
+
+          [install]
+          dir = ".vendor/.zed"
+          adapter = "node"
+
+          [dependencies]
+          "zedtest/multiversion-lib-python2" = "^0.1.0"
+          TOML
+          # A Python 2 source tree installing into an npm project without complaint.
+          "$ZED" install --registry "file://$RUNNER_TEMP/reg" \
+            --home "$RUNNER_TEMP/home" --install-mode copy
+          installed=.vendor/.zed/zedtest/multiversion-lib-python2
+          test -f "$installed/setup.py"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          index = json.loads(Path(".zed/paths.json").read_text())
+          entry = next(
+              p for p in index["packages"]
+              if p["package"] == "zedtest/multiversion-lib-python2"
+          )
+          assert entry["language"] == "universal", (
+              f"language is now {entry['language']!r} -- the gap is fixed; "
+              "update this fixture to assert the real tag"
+          )
+          assert entry["ecosystem"] == "universal", entry["ecosystem"]
+          print("characterized: versioned targets tag as universal")
+          PY
